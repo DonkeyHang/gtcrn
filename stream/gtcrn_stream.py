@@ -354,6 +354,8 @@ if __name__ == "__main__":
     import os
     import time
     import soundfile as sf
+    import numpy as np
+    from scipy import signal
     from tqdm import tqdm
     from gtcrn import GTCRN
     from modules.convert import convert_to_stream
@@ -361,39 +363,50 @@ if __name__ == "__main__":
     device = torch.device("cpu")
 
     model = GTCRN().to(device).eval()
-    model.load_state_dict(torch.load('onnx_models/model_trained_on_dns3.tar', map_location=device)['model'])
+    model.load_state_dict(torch.load('/Users/donkeyddddd/Documents/Rx_projects/python_projects/gtcrn/stream/onnx_models/model_trained_on_dns3.tar', map_location=device)['model'])
     stream_model = StreamGTCRN().to(device).eval()
     convert_to_stream(stream_model, model)
     
     """Streaming Conversion"""
     ### offline inference
-    x = torch.from_numpy(sf.read('test_wavs/mix.wav', dtype='float32')[0])
+    audio_file = '/Users/donkeyddddd/Documents/Rx_projects/python_projects/gtcrn/stream/test_wavs/mix2.wav'
+    audio, fs = sf.read(audio_file, dtype='float32')
+    
+    # 检查采样率，如果不是16000Hz则进行重采样
+    target_fs = 16000
+    if fs != target_fs:
+        print(f"原始采样率: {fs}Hz, 重采样到: {target_fs}Hz")
+        # 使用scipy.signal进行重采样，避免librosa依赖
+        num_samples = round(len(audio) * target_fs / fs)
+        audio = signal.resample(audio, num_samples)
+    
+    x = torch.from_numpy(audio)
     x = torch.stft(x, 512, 256, 512, torch.hann_window(512).pow(0.5), return_complex=False)[None]
     with torch.no_grad():
         y = model(x)
     y = torch.istft(y, 512, 256, 512, torch.hann_window(512).pow(0.5)).detach().cpu().numpy()
-    sf.write('test_wavs/enh.wav', y.squeeze(), 16000)
+    sf.write('/Users/donkeyddddd/Documents/Rx_projects/python_projects/gtcrn/stream/test_wavs/enh.wav', y.squeeze(), 16000)
     
     ### online (streaming) inference
     conv_cache = torch.zeros(2, 1, 16, 16, 33).to(device)
     tra_cache = torch.zeros(2, 3, 1, 1, 16).to(device)
     inter_cache = torch.zeros(2, 1, 33, 16).to(device)
-    # ys = []
-    # times = []
-    # for i in tqdm(range(x.shape[2])):
-    #     xi = x[:,:,i:i+1]
-    #     tic = time.perf_counter()
-    #     with torch.no_grad():
-    #         yi, conv_cache, tra_cache, inter_cache = stream_model(xi, conv_cache, tra_cache, inter_cache)
-    #     toc = time.perf_counter()
-    #     times.append((toc-tic)*1000)
-    #     ys.append(yi)
-    # ys = torch.cat(ys, dim=2)
+    ys = []
+    times = []
+    for i in tqdm(range(x.shape[2])):
+        xi = x[:,:,i:i+1]
+        tic = time.perf_counter()
+        with torch.no_grad():
+            yi, conv_cache, tra_cache, inter_cache = stream_model(xi, conv_cache, tra_cache, inter_cache)
+        toc = time.perf_counter()
+        times.append((toc-tic)*1000)
+        ys.append(yi)
+    ys = torch.cat(ys, dim=2)
 
-    # ys = torch.istft(ys, 512, 256, 512, torch.hann_window(512).pow(0.5)).detach().cpu().numpy()
-    # sf.write('test_wavs/enh_stream.wav', ys.squeeze(), 16000)
-    # print(">>> inference time: mean: {:.1f}ms, max: {:.1f}ms, min: {:.1f}ms".format(sum(times)/len(times), max(times), min(times)))
-    # print(">>> Streaming error:", np.abs(y-ys).max())
+    ys = torch.istft(ys, 512, 256, 512, torch.hann_window(512).pow(0.5)).detach().cpu().numpy()
+    sf.write('/Users/donkeyddddd/Documents/Rx_projects/python_projects/gtcrn/stream/test_wavs/enh_stream.wav', ys.squeeze(), 16000)
+    print(">>> inference time: mean: {:.1f}ms, max: {:.1f}ms, min: {:.1f}ms".format(sum(times)/len(times), max(times), min(times)))
+    print(">>> Streaming error:", np.abs(y-ys).max())
 
 
     """ONNX Conversion"""
@@ -402,7 +415,45 @@ if __name__ == "__main__":
     import onnx
     import onnxruntime
     from onnxsim import simplify
-    from librosa import istft
+    
+    # 自定义istft函数，避免依赖librosa
+    def istft(stft_matrix, n_fft=2048, hop_length=None, win_length=None, window=None):
+        if hop_length is None:
+            hop_length = n_fft // 4
+        if win_length is None:
+            win_length = n_fft
+        if window is None:
+            window = np.ones(win_length)
+            
+        # 将复数形式的STFT结果转换回时域信号
+        time_signal = np.zeros((stft_matrix.shape[0] - 1) * hop_length + n_fft)
+        
+        # 窗口计数，用于归一化
+        window_count = np.zeros_like(time_signal)
+        
+        for i in range(stft_matrix.shape[1]):
+            # 获取当前帧
+            spec = stft_matrix[:, i]
+            
+            # 执行IFFT
+            ifft_signal = np.fft.irfft(spec, n=n_fft)
+            
+            # 应用窗函数
+            ifft_windowed = ifft_signal[:win_length] * window
+            
+            # 在时域中重叠相加
+            start = i * hop_length
+            end = start + win_length
+            time_signal[start:end] += ifft_windowed
+            window_count[start:end] += window
+            
+        # 避免除以零
+        window_count[window_count == 0] = 1
+        
+        # 归一化
+        time_signal /= window_count
+        
+        return time_signal
     
     ## convert to onnx
     file = 'onnx_models/gtcrn.onnx'
@@ -457,4 +508,3 @@ if __name__ == "__main__":
     print(">>> Onnx error:", np.abs(y - enhanced).max())
     print(">>> inference time: mean: {:.1f}ms, max: {:.1f}ms, min: {:.1f}ms".format(1e3*np.mean(T_list), 1e3*np.max(T_list), 1e3*np.min(T_list)))
     print(">>> RTF:", 1e3*np.mean(T_list) / 16)
-
